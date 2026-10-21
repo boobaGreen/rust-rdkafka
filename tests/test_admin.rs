@@ -5,6 +5,7 @@ use std::time::Duration;
 use backon::{BlockingRetryable, ExponentialBuilder};
 
 use rdkafka::admin::{
+    AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
     AdminClient, AdminOptions, AlterConfig, ConfigEntry, ConfigSource, ConsumerGroupState,
     ConsumerGroupType, GroupResult, NewPartitions, NewTopic, OwnedResourceSpecifier,
     ResourceSpecifier, TopicReplication,
@@ -671,6 +672,131 @@ async fn test_describe_consumer_groups() {
             }
         }
     }
+}
+
+/// The ACL bindings that match `filter`, sorted by name, once there are
+/// `expected` of them. With KRaft, new and deleted bindings reach the
+/// broker's cache through the metadata log, shortly after the response.
+async fn describe_acls_until(
+    admin_client: &AdminClient<DefaultClientContext>,
+    filter: &AclBindingFilter,
+    expected: usize,
+) -> Vec<AclBinding> {
+    let opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(30)));
+    let mut found = Vec::new();
+    for _ in 0..100 {
+        found = admin_client
+            .describe_acls(filter, &opts)
+            .await
+            .expect("describe ACLs failed");
+        if found.len() == expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    found.sort_by_key(|acl| acl.name.clone());
+    found
+}
+
+#[tokio::test]
+async fn test_acls() {
+    let admin_client = create_admin_client();
+    let opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(30)));
+    let principal = format!("User:{}", rand_test_group());
+    let filter = AclBindingFilter {
+        principal: Some(principal.clone()),
+        ..AclBindingFilter::any()
+    };
+
+    // Without an authorizer the broker answers DescribeAcls with
+    // SECURITY_DISABLED, but librdkafka 2.12 drops that error code and
+    // returns no bindings.
+    let res = admin_client.describe_acls(&filter, &opts).await;
+    assert_eq!(res, Ok(vec![]));
+
+    let read = AclBinding {
+        resource_type: AclResourceType::Topic,
+        name: "acl_test_".into(),
+        pattern_type: AclPatternType::Prefixed,
+        principal: principal.clone(),
+        host: "*".into(),
+        operation: AclOperation::Read,
+        permission_type: AclPermissionType::Allow,
+    };
+    let deny = AclBinding {
+        resource_type: AclResourceType::Group,
+        name: "acl_test_group".into(),
+        pattern_type: AclPatternType::Literal,
+        operation: AclOperation::Describe,
+        permission_type: AclPermissionType::Deny,
+        ..read.clone()
+    };
+    let res = admin_client
+        .create_acls(&[read.clone(), deny.clone()], &opts)
+        .await
+        .expect("create ACLs failed");
+    // ACLs need an authorizer on the broker
+    // (`authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer`).
+    if let Some(Err((RDKafkaErrorCode::SecurityDisabled, _))) = res.first() {
+        eprintln!("skipping test_acls: the broker has no authorizer");
+        return;
+    }
+    assert_eq!(res, vec![Ok(()), Ok(())]);
+
+    // A binding with "any" values cannot be created: librdkafka rejects it
+    // before sending the request.
+    let invalid = AclBinding {
+        resource_type: AclResourceType::Any,
+        ..read.clone()
+    };
+    let res = admin_client.create_acls(&[invalid], &opts).await;
+    assert!(
+        matches!(res, Err(KafkaError::AdminOpCreation(_))),
+        "{:?}",
+        res
+    );
+
+    let found = describe_acls_until(&admin_client, &filter, 2).await;
+    assert_eq!(found, vec![read.clone(), deny.clone()]);
+
+    // A MATCH filter finds the prefixed binding for a topic it covers.
+    let matching = AclBindingFilter {
+        resource_type: AclResourceType::Topic,
+        name: Some("acl_test_topic".into()),
+        pattern_type: AclPatternType::Match,
+        ..filter.clone()
+    };
+    let res = admin_client.describe_acls(&matching, &opts).await;
+    assert_eq!(res, Ok(vec![read.clone()]));
+
+    // Deleting with an exact filter removes only that binding.
+    let res = admin_client
+        .delete_acls(&[AclBindingFilter::from(&read)], &opts)
+        .await;
+    assert_eq!(res, Ok(vec![Ok(vec![read.clone()])]));
+    assert_eq!(
+        describe_acls_until(&admin_client, &filter, 1).await,
+        vec![deny.clone()]
+    );
+    let res = admin_client
+        .delete_acls(&[AclBindingFilter::from(&read), filter.clone()], &opts)
+        .await;
+    assert_eq!(res, Ok(vec![Ok(vec![]), Ok(vec![deny.clone()])]));
+    assert_eq!(describe_acls_until(&admin_client, &filter, 0).await, vec![]);
+}
+
+#[test]
+fn test_acl_names() {
+    assert_eq!(AclOperation::Read.to_string(), "READ");
+    assert_eq!(
+        AclOperation::IdempotentWrite.to_string(),
+        "IDEMPOTENT_WRITE"
+    );
+    assert_eq!(AclPermissionType::Allow.to_string(), "ALLOW");
+    assert_eq!(AclPatternType::Prefixed.to_string(), "PREFIXED");
+    assert_eq!(AclResourceType::Topic.to_string(), "TOPIC");
+    assert_eq!(ConsumerGroupState::Stable.to_string(), "Stable");
+    assert_eq!(ConsumerGroupType::Consumer.to_string(), "Consumer");
 }
 
 // Tests whether each admin operation properly reports an error if the entire

@@ -230,6 +230,113 @@ impl<C: ClientContext> AdminClient<C> {
         Ok(rx)
     }
 
+    /// Creates the given ACL bindings.
+    ///
+    /// The result has one entry per binding, in the same order.
+    pub fn create_acls(
+        &self,
+        acls: &[AclBinding],
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<AclResult>>> {
+        match self.create_acls_inner(acls, opts) {
+            Ok(rx) => Either::Left(CreateAclsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn create_acls_inner(
+        &self,
+        acls: &[AclBinding],
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>> {
+        let mut err_buf = ErrBuf::new();
+        let native_acls = acls
+            .iter()
+            .map(|acl| acl.to_native(&mut err_buf))
+            .collect::<KafkaResult<Vec<_>>>()?;
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        // librdkafka copies the bindings, which are destroyed on return.
+        unsafe {
+            rdsys::rd_kafka_CreateAcls(
+                self.client.native_ptr(),
+                native_acls.as_c_array(),
+                native_acls.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            )
+        }
+        Ok(rx)
+    }
+
+    /// Describes the ACL bindings that match the given filter.
+    pub fn describe_acls(
+        &self,
+        filter: &AclBindingFilter,
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<AclBinding>>> {
+        match self.describe_acls_inner(filter, opts) {
+            Ok(rx) => Either::Left(DescribeAclsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn describe_acls_inner(
+        &self,
+        filter: &AclBindingFilter,
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>> {
+        let mut err_buf = ErrBuf::new();
+        let native_filter = filter.to_native(&mut err_buf)?;
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        unsafe {
+            rdsys::rd_kafka_DescribeAcls(
+                self.client.native_ptr(),
+                native_filter.ptr(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            )
+        }
+        Ok(rx)
+    }
+
+    /// Deletes the ACL bindings that match the given filters.
+    ///
+    /// The result has one entry per filter, in the same order, with the
+    /// bindings that the filter matched and deleted.
+    pub fn delete_acls(
+        &self,
+        filters: &[AclBindingFilter],
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<DeleteAclsResult>>> {
+        match self.delete_acls_inner(filters, opts) {
+            Ok(rx) => Either::Left(DeleteAclsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn delete_acls_inner(
+        &self,
+        filters: &[AclBindingFilter],
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>> {
+        let mut err_buf = ErrBuf::new();
+        let native_filters = filters
+            .iter()
+            .map(|filter| filter.to_native(&mut err_buf))
+            .collect::<KafkaResult<Vec<_>>>()?;
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        unsafe {
+            rdsys::rd_kafka_DeleteAcls(
+                self.client.native_ptr(),
+                native_filters.as_c_array(),
+                native_filters.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            )
+        }
+        Ok(rx)
+    }
+
     /// Adds additional partitions to existing topics according to the provided
     /// `NewPartitions` specifications.
     ///
@@ -1136,13 +1243,10 @@ unsafe fn build_consumer_group_description(
     group: *const rdsys::rd_kafka_ConsumerGroupDescription_t,
 ) -> ConsumerGroupDescriptionResult {
     let group_id = cstr_to_owned(rdsys::rd_kafka_ConsumerGroupDescription_group_id(group));
-    let err = rdsys::rd_kafka_ConsumerGroupDescription_error(group);
-    if !err.is_null() {
-        let code = rdsys::rd_kafka_error_code(err);
-        if code.is_error() {
-            let message = cstr_to_opt_owned(rdsys::rd_kafka_error_string(err)).unwrap_or_default();
-            return Err((group_id, code.into(), message));
-        }
+    if let Some((code, message)) =
+        error_with_message(rdsys::rd_kafka_ConsumerGroupDescription_error(group))
+    {
+        return Err((group_id, code, message));
     }
     let member_count = rdsys::rd_kafka_ConsumerGroupDescription_member_count(group);
     let members = (0..member_count)
@@ -1192,6 +1296,424 @@ impl Future for DescribeConsumerGroupsFuture {
         let groups = unsafe { rdsys::rd_kafka_DescribeConsumerGroups_result_groups(res, &mut n) };
         let out = (0..n)
             .map(|i| unsafe { build_consumer_group_description(*groups.add(i)) })
+            .collect();
+        Poll::Ready(Ok(out))
+    }
+}
+
+//
+// ACL handling
+//
+
+/// Declares an enum that mirrors a librdkafka enum, with conversions in
+/// both directions and the librdkafka name of each value.
+macro_rules! acl_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident, $native:ty, $name_fn:path, $unknown:ident {
+            $($(#[$vmeta:meta])* $variant:ident = $native_variant:ident,)*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($(#[$vmeta])* $variant,)*
+        }
+
+        impl $name {
+            fn to_native(self) -> $native {
+                match self {
+                    $(Self::$variant => <$native>::$native_variant,)*
+                }
+            }
+
+            fn from_native(native: $native) -> Self {
+                match native {
+                    $(<$native>::$native_variant => Self::$variant,)*
+                    #[allow(unreachable_patterns)]
+                    _ => Self::$unknown,
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let name = unsafe { cstr_to_opt_owned($name_fn(self.to_native())) };
+                f.write_str(name.as_deref().unwrap_or("UNKNOWN"))
+            }
+        }
+    };
+}
+
+acl_enum! {
+    /// The type of resource an ACL binding applies to.
+    AclResourceType,
+    RDKafkaResourceType,
+    rdsys::rd_kafka_ResourceType_name,
+    Unknown {
+        /// An unknown resource type.
+        Unknown = RD_KAFKA_RESOURCE_UNKNOWN,
+        /// Any resource type (filters only).
+        Any = RD_KAFKA_RESOURCE_ANY,
+        /// A topic.
+        Topic = RD_KAFKA_RESOURCE_TOPIC,
+        /// A consumer group.
+        Group = RD_KAFKA_RESOURCE_GROUP,
+        /// The cluster (named `kafka-cluster`).
+        Cluster = RD_KAFKA_RESOURCE_BROKER,
+        /// A transactional ID.
+        TransactionalId = RD_KAFKA_RESOURCE_TRANSACTIONAL_ID,
+    }
+}
+
+acl_enum! {
+    /// How the resource name of an ACL binding is matched.
+    AclPatternType,
+    rdsys::rd_kafka_ResourcePatternType_t,
+    rdsys::rd_kafka_ResourcePatternType_name,
+    Unknown {
+        /// An unknown pattern type.
+        Unknown = RD_KAFKA_RESOURCE_PATTERN_UNKNOWN,
+        /// Any pattern type (filters only).
+        Any = RD_KAFKA_RESOURCE_PATTERN_ANY,
+        /// Every binding that would apply to the name (filters only).
+        Match = RD_KAFKA_RESOURCE_PATTERN_MATCH,
+        /// The name is the exact resource name.
+        Literal = RD_KAFKA_RESOURCE_PATTERN_LITERAL,
+        /// The name is a prefix of the resource names.
+        Prefixed = RD_KAFKA_RESOURCE_PATTERN_PREFIXED,
+    }
+}
+
+acl_enum! {
+    /// The operation an ACL binding allows or denies.
+    AclOperation,
+    rdsys::rd_kafka_AclOperation_t,
+    rdsys::rd_kafka_AclOperation_name,
+    Unknown {
+        /// An unknown operation.
+        Unknown = RD_KAFKA_ACL_OPERATION_UNKNOWN,
+        /// Any operation (filters only).
+        Any = RD_KAFKA_ACL_OPERATION_ANY,
+        /// All operations.
+        All = RD_KAFKA_ACL_OPERATION_ALL,
+        /// Read.
+        Read = RD_KAFKA_ACL_OPERATION_READ,
+        /// Write.
+        Write = RD_KAFKA_ACL_OPERATION_WRITE,
+        /// Create.
+        Create = RD_KAFKA_ACL_OPERATION_CREATE,
+        /// Delete.
+        Delete = RD_KAFKA_ACL_OPERATION_DELETE,
+        /// Alter.
+        Alter = RD_KAFKA_ACL_OPERATION_ALTER,
+        /// Describe.
+        Describe = RD_KAFKA_ACL_OPERATION_DESCRIBE,
+        /// Cluster action.
+        ClusterAction = RD_KAFKA_ACL_OPERATION_CLUSTER_ACTION,
+        /// Describe configs.
+        DescribeConfigs = RD_KAFKA_ACL_OPERATION_DESCRIBE_CONFIGS,
+        /// Alter configs.
+        AlterConfigs = RD_KAFKA_ACL_OPERATION_ALTER_CONFIGS,
+        /// Idempotent write.
+        IdempotentWrite = RD_KAFKA_ACL_OPERATION_IDEMPOTENT_WRITE,
+    }
+}
+
+acl_enum! {
+    /// Whether an ACL binding allows or denies the operation.
+    AclPermissionType,
+    rdsys::rd_kafka_AclPermissionType_t,
+    rdsys::rd_kafka_AclPermissionType_name,
+    Unknown {
+        /// An unknown permission type.
+        Unknown = RD_KAFKA_ACL_PERMISSION_TYPE_UNKNOWN,
+        /// Any permission type (filters only).
+        Any = RD_KAFKA_ACL_PERMISSION_TYPE_ANY,
+        /// Deny.
+        Deny = RD_KAFKA_ACL_PERMISSION_TYPE_DENY,
+        /// Allow.
+        Allow = RD_KAFKA_ACL_PERMISSION_TYPE_ALLOW,
+    }
+}
+
+/// An ACL binding: a principal is allowed or denied an operation on the
+/// resources that match a pattern.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AclBinding {
+    /// The type of the resource.
+    pub resource_type: AclResourceType,
+    /// The resource name, or prefix.
+    pub name: String,
+    /// How `name` is matched: [`AclPatternType::Literal`] or
+    /// [`AclPatternType::Prefixed`].
+    pub pattern_type: AclPatternType,
+    /// The principal, for example `User:alice`.
+    pub principal: String,
+    /// The host, or `*` for every host.
+    pub host: String,
+    /// The operation.
+    pub operation: AclOperation,
+    /// Allow or deny.
+    pub permission_type: AclPermissionType,
+}
+
+/// A filter for ACL bindings: `None` fields and the `Any` values match
+/// everything.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AclBindingFilter {
+    /// The type of the resource.
+    pub resource_type: AclResourceType,
+    /// The resource name.
+    pub name: Option<String>,
+    /// How the name is matched.
+    pub pattern_type: AclPatternType,
+    /// The principal.
+    pub principal: Option<String>,
+    /// The host.
+    pub host: Option<String>,
+    /// The operation.
+    pub operation: AclOperation,
+    /// The permission type.
+    pub permission_type: AclPermissionType,
+}
+
+impl AclBindingFilter {
+    /// A filter that matches every ACL binding.
+    pub fn any() -> AclBindingFilter {
+        AclBindingFilter {
+            resource_type: AclResourceType::Any,
+            name: None,
+            pattern_type: AclPatternType::Any,
+            principal: None,
+            host: None,
+            operation: AclOperation::Any,
+            permission_type: AclPermissionType::Any,
+        }
+    }
+}
+
+impl From<&AclBinding> for AclBindingFilter {
+    /// A filter that matches exactly this binding.
+    fn from(acl: &AclBinding) -> Self {
+        AclBindingFilter {
+            resource_type: acl.resource_type,
+            name: Some(acl.name.clone()),
+            pattern_type: acl.pattern_type,
+            principal: Some(acl.principal.clone()),
+            host: Some(acl.host.clone()),
+            operation: acl.operation,
+            permission_type: acl.permission_type,
+        }
+    }
+}
+
+type NativeAclBinding = NativePtr<rdsys::rd_kafka_AclBinding_t>;
+
+unsafe impl KafkaDrop for rdsys::rd_kafka_AclBinding_t {
+    const TYPE: &'static str = "ACL binding";
+    const DROP: unsafe extern "C" fn(*mut Self) = rdsys::rd_kafka_AclBinding_destroy;
+}
+
+fn optional_cstring(value: Option<&str>) -> KafkaResult<Option<CString>> {
+    Ok(value.map(CString::new).transpose()?)
+}
+
+fn optional_ptr(value: &Option<CString>) -> *const c_char {
+    value.as_ref().map_or(std::ptr::null(), |v| v.as_ptr())
+}
+
+/// The result of `rd_kafka_AclBinding_new` or `rd_kafka_AclBindingFilter_new`.
+fn native_acl_binding(
+    ptr: *mut rdsys::rd_kafka_AclBinding_t,
+    err_buf: &ErrBuf,
+) -> KafkaResult<NativeAclBinding> {
+    unsafe { NativeAclBinding::from_ptr(ptr) }.ok_or_else(|| {
+        KafkaError::AdminOpCreation(if err_buf.len() == 0 {
+            "invalid ACL binding".into()
+        } else {
+            err_buf.to_string()
+        })
+    })
+}
+
+impl AclBinding {
+    fn to_native(&self, err_buf: &mut ErrBuf) -> KafkaResult<NativeAclBinding> {
+        let name = CString::new(self.name.as_str())?;
+        let principal = CString::new(self.principal.as_str())?;
+        let host = CString::new(self.host.as_str())?;
+        let ptr = unsafe {
+            rdsys::rd_kafka_AclBinding_new(
+                self.resource_type.to_native(),
+                name.as_ptr(),
+                self.pattern_type.to_native(),
+                principal.as_ptr(),
+                host.as_ptr(),
+                self.operation.to_native(),
+                self.permission_type.to_native(),
+                err_buf.as_mut_ptr(),
+                err_buf.capacity(),
+            )
+        };
+        native_acl_binding(ptr, err_buf)
+    }
+
+    unsafe fn from_native(acl: *const rdsys::rd_kafka_AclBinding_t) -> AclBinding {
+        AclBinding {
+            resource_type: AclResourceType::from_native(rdsys::rd_kafka_AclBinding_restype(acl)),
+            name: cstr_to_opt_owned(rdsys::rd_kafka_AclBinding_name(acl)).unwrap_or_default(),
+            pattern_type: AclPatternType::from_native(
+                rdsys::rd_kafka_AclBinding_resource_pattern_type(acl),
+            ),
+            principal: cstr_to_opt_owned(rdsys::rd_kafka_AclBinding_principal(acl))
+                .unwrap_or_default(),
+            host: cstr_to_opt_owned(rdsys::rd_kafka_AclBinding_host(acl)).unwrap_or_default(),
+            operation: AclOperation::from_native(rdsys::rd_kafka_AclBinding_operation(acl)),
+            permission_type: AclPermissionType::from_native(
+                rdsys::rd_kafka_AclBinding_permission_type(acl),
+            ),
+        }
+    }
+}
+
+impl AclBindingFilter {
+    fn to_native(&self, err_buf: &mut ErrBuf) -> KafkaResult<NativeAclBinding> {
+        let name = optional_cstring(self.name.as_deref())?;
+        let principal = optional_cstring(self.principal.as_deref())?;
+        let host = optional_cstring(self.host.as_deref())?;
+        let ptr = unsafe {
+            rdsys::rd_kafka_AclBindingFilter_new(
+                self.resource_type.to_native(),
+                optional_ptr(&name),
+                self.pattern_type.to_native(),
+                optional_ptr(&principal),
+                optional_ptr(&host),
+                self.operation.to_native(),
+                self.permission_type.to_native(),
+                err_buf.as_mut_ptr(),
+                err_buf.capacity(),
+            )
+        };
+        native_acl_binding(ptr, err_buf)
+    }
+}
+
+/// An error code with its message, if the error is set.
+unsafe fn error_with_message(
+    err: *const rdsys::rd_kafka_error_t,
+) -> Option<(RDKafkaErrorCode, String)> {
+    if err.is_null() {
+        return None;
+    }
+    let code = rdsys::rd_kafka_error_code(err);
+    if code.is_error() {
+        let message = cstr_to_opt_owned(rdsys::rd_kafka_error_string(err)).unwrap_or_default();
+        Some((code.into(), message))
+    } else {
+        None
+    }
+}
+
+/// The result of creating an individual ACL binding.
+pub type AclResult = Result<(), (RDKafkaErrorCode, String)>;
+
+/// The result of an individual DeleteAcls filter: the deleted bindings.
+pub type DeleteAclsResult = Result<Vec<AclBinding>, (RDKafkaErrorCode, String)>;
+
+unsafe fn build_acl_bindings(
+    acls: *mut *const rdsys::rd_kafka_AclBinding_t,
+    n: usize,
+) -> Vec<AclBinding> {
+    (0..n)
+        .map(|i| AclBinding::from_native(*acls.add(i)))
+        .collect()
+}
+
+/// The admin result of an event, or an error if the event is not of the
+/// expected type.
+fn admin_result<T>(event: &NativeEvent, res: *const T, request: &str) -> KafkaResult<()> {
+    if res.is_null() {
+        let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+        Err(KafkaError::AdminOpCreation(format!(
+            "{} request received response of incorrect type ({})",
+            request, typ
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+struct CreateAclsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for CreateAclsFuture {
+    type Output = KafkaResult<Vec<AclResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_CreateAcls_result(event.ptr()) };
+        admin_result(&event, res, "create ACLs")?;
+        let mut n = 0;
+        let results = unsafe { rdsys::rd_kafka_CreateAcls_result_acls(res, &mut n) };
+        let out = (0..n)
+            .map(|i| unsafe {
+                match error_with_message(rdsys::rd_kafka_acl_result_error(*results.add(i))) {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
+            })
+            .collect();
+        Poll::Ready(Ok(out))
+    }
+}
+
+struct DescribeAclsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for DescribeAclsFuture {
+    type Output = KafkaResult<Vec<AclBinding>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_DescribeAcls_result(event.ptr()) };
+        admin_result(&event, res, "describe ACLs")?;
+        let mut n = 0;
+        let acls = unsafe { rdsys::rd_kafka_DescribeAcls_result_acls(res, &mut n) };
+        Poll::Ready(Ok(unsafe { build_acl_bindings(acls, n) }))
+    }
+}
+
+struct DeleteAclsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for DeleteAclsFuture {
+    type Output = KafkaResult<Vec<DeleteAclsResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_DeleteAcls_result(event.ptr()) };
+        admin_result(&event, res, "delete ACLs")?;
+        let mut n = 0;
+        let responses = unsafe { rdsys::rd_kafka_DeleteAcls_result_responses(res, &mut n) };
+        let out = (0..n)
+            .map(|i| unsafe {
+                let response = *responses.add(i);
+                if let Some(err) =
+                    error_with_message(rdsys::rd_kafka_DeleteAcls_result_response_error(response))
+                {
+                    return Err(err);
+                }
+                let mut m = 0;
+                let acls =
+                    rdsys::rd_kafka_DeleteAcls_result_response_matching_acls(response, &mut m);
+                Ok(build_acl_bindings(acls, m))
+            })
             .collect();
         Poll::Ready(Ok(out))
     }
