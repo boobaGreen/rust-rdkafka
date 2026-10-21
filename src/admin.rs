@@ -5,7 +5,7 @@
 //! [`AdminClient`]: struct.AdminClient.html
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -26,7 +26,9 @@ use crate::client::{Client, ClientContext, DefaultClientContext, NativeQueue};
 use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::log::{trace, warn};
-use crate::util::{cstr_to_owned, AsCArray, ErrBuf, IntoOpaque, KafkaDrop, NativePtr, Timeout};
+use crate::util::{
+    cstr_to_opt_owned, cstr_to_owned, AsCArray, ErrBuf, IntoOpaque, KafkaDrop, NativePtr, Timeout,
+};
 use crate::TopicPartitionList;
 
 //
@@ -175,6 +177,52 @@ impl<C: ClientContext> AdminClient<C> {
                 self.client.native_ptr(),
                 native_groups.as_c_array(),
                 native_groups.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            )
+        }
+        Ok(rx)
+    }
+
+    /// Describes the named consumer groups.
+    ///
+    /// Unlike [`Client::fetch_group_list`], which only knows about classic
+    /// groups, this also describes the groups of the consumer protocol
+    /// introduced by KIP-848: librdkafka sends a ConsumerGroupDescribe request
+    /// and falls back to DescribeGroups for classic groups.
+    ///
+    /// Groups whose protocol type is neither empty nor `consumer` (for
+    /// example Kafka Connect groups) are reported as errors with
+    /// [`RDKafkaErrorCode::InvalidArgument`].
+    pub fn describe_consumer_groups(
+        &self,
+        group_names: &[&str],
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<ConsumerGroupDescriptionResult>>> {
+        match self.describe_consumer_groups_inner(group_names, opts) {
+            Ok(rx) => Either::Left(DescribeConsumerGroupsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn describe_consumer_groups_inner(
+        &self,
+        group_names: &[&str],
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>> {
+        let names = group_names
+            .iter()
+            .map(|gn| CString::new(*gn))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+        let mut err_buf = ErrBuf::new();
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        // librdkafka copies the names, so `names` only needs to outlive the call.
+        unsafe {
+            rdsys::rd_kafka_DescribeConsumerGroups(
+                self.client.native_ptr(),
+                name_ptrs.as_mut_ptr(),
+                name_ptrs.len(),
                 native_opts.ptr(),
                 self.queue.ptr(),
             )
@@ -892,6 +940,260 @@ impl Future for DeleteGroupsFuture {
         let mut n = 0;
         let groups = unsafe { rdsys::rd_kafka_DeleteGroups_result_groups(res, &mut n) };
         Poll::Ready(Ok(build_group_results(groups, n)))
+    }
+}
+
+//
+// Describe consumer groups handling
+//
+
+/// The state of a consumer group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConsumerGroupState {
+    /// The state is unknown, or not one librdkafka can name (for example the
+    /// `Assigning` and `Reconciling` states of KIP-848 groups).
+    Unknown,
+    /// The group is preparing a rebalance.
+    PreparingRebalance,
+    /// The group is completing a rebalance.
+    CompletingRebalance,
+    /// The group is stable.
+    Stable,
+    /// The group does not exist or is being deleted.
+    Dead,
+    /// The group has no members.
+    Empty,
+}
+
+impl ConsumerGroupState {
+    fn from_native(state: rdsys::rd_kafka_consumer_group_state_t) -> Self {
+        use rdsys::rd_kafka_consumer_group_state_t::*;
+        match state {
+            RD_KAFKA_CONSUMER_GROUP_STATE_PREPARING_REBALANCE => Self::PreparingRebalance,
+            RD_KAFKA_CONSUMER_GROUP_STATE_COMPLETING_REBALANCE => Self::CompletingRebalance,
+            RD_KAFKA_CONSUMER_GROUP_STATE_STABLE => Self::Stable,
+            RD_KAFKA_CONSUMER_GROUP_STATE_DEAD => Self::Dead,
+            RD_KAFKA_CONSUMER_GROUP_STATE_EMPTY => Self::Empty,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for ConsumerGroupState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unknown => "Unknown",
+            Self::PreparingRebalance => "PreparingRebalance",
+            Self::CompletingRebalance => "CompletingRebalance",
+            Self::Stable => "Stable",
+            Self::Dead => "Dead",
+            Self::Empty => "Empty",
+        })
+    }
+}
+
+/// The protocol of a consumer group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConsumerGroupType {
+    /// The type is unknown (for example, the broker is too old to say).
+    Unknown,
+    /// The consumer protocol introduced by KIP-848.
+    Consumer,
+    /// The classic protocol.
+    Classic,
+}
+
+impl ConsumerGroupType {
+    fn from_native(group_type: rdsys::rd_kafka_consumer_group_type_t) -> Self {
+        use rdsys::rd_kafka_consumer_group_type_t::*;
+        match group_type {
+            RD_KAFKA_CONSUMER_GROUP_TYPE_CONSUMER => Self::Consumer,
+            RD_KAFKA_CONSUMER_GROUP_TYPE_CLASSIC => Self::Classic,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for ConsumerGroupType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unknown => "Unknown",
+            Self::Consumer => "Consumer",
+            Self::Classic => "Classic",
+        })
+    }
+}
+
+/// A broker, as returned by the admin API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    /// The broker ID.
+    pub id: i32,
+    /// The broker host.
+    pub host: String,
+    /// The broker port.
+    pub port: u16,
+    /// The broker rack, if any.
+    pub rack: Option<String>,
+}
+
+impl Node {
+    unsafe fn from_native(node: *const rdsys::rd_kafka_Node_t) -> Option<Node> {
+        if node.is_null() {
+            return None;
+        }
+        Some(Node {
+            id: rdsys::rd_kafka_Node_id(node),
+            host: cstr_to_owned(rdsys::rd_kafka_Node_host(node)),
+            port: rdsys::rd_kafka_Node_port(node),
+            rack: cstr_to_opt_owned(rdsys::rd_kafka_Node_rack(node)),
+        })
+    }
+}
+
+/// A member of a consumer group.
+#[derive(Debug, Clone)]
+pub struct MemberDescription {
+    /// The client ID of the member.
+    pub client_id: String,
+    /// The group instance ID, for static members.
+    pub group_instance_id: Option<String>,
+    /// The member ID assigned by the group coordinator.
+    pub consumer_id: String,
+    /// The host the member connects from.
+    pub host: String,
+    /// The partitions assigned to the member.
+    pub assignment: TopicPartitionList,
+    /// The partitions the member is moving to (KIP-848 groups only).
+    pub target_assignment: Option<TopicPartitionList>,
+}
+
+/// The description of a consumer group.
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupDescription {
+    /// The group ID.
+    pub group_id: String,
+    /// Whether the group is a simple consumer group (no protocol type).
+    pub is_simple_consumer_group: bool,
+    /// The partition assignor of the group.
+    pub partition_assignor: String,
+    /// The state of the group.
+    pub state: ConsumerGroupState,
+    /// The protocol of the group.
+    pub group_type: ConsumerGroupType,
+    /// The coordinator of the group, if known.
+    pub coordinator: Option<Node>,
+    /// The members of the group.
+    pub members: Vec<MemberDescription>,
+}
+
+/// The result of an individual DescribeConsumerGroups operation: the
+/// description, or the group ID with the error code and message.
+pub type ConsumerGroupDescriptionResult =
+    Result<ConsumerGroupDescription, (String, RDKafkaErrorCode, String)>;
+
+/// A copy of a topic partition list owned by librdkafka.
+unsafe fn copy_partition_list(tpl: *const RDKafkaTopicPartitionList) -> Option<TopicPartitionList> {
+    if tpl.is_null() {
+        None
+    } else {
+        Some(TopicPartitionList::from_ptr(
+            rdsys::rd_kafka_topic_partition_list_copy(tpl),
+        ))
+    }
+}
+
+/// A copy of a member assignment owned by librdkafka.
+unsafe fn copy_assignment(
+    assignment: *const rdsys::rd_kafka_MemberAssignment_t,
+) -> Option<TopicPartitionList> {
+    if assignment.is_null() {
+        None
+    } else {
+        copy_partition_list(rdsys::rd_kafka_MemberAssignment_partitions(assignment))
+    }
+}
+
+unsafe fn build_member_description(
+    member: *const rdsys::rd_kafka_MemberDescription_t,
+) -> MemberDescription {
+    MemberDescription {
+        client_id: cstr_to_owned(rdsys::rd_kafka_MemberDescription_client_id(member)),
+        group_instance_id: cstr_to_opt_owned(rdsys::rd_kafka_MemberDescription_group_instance_id(
+            member,
+        )),
+        consumer_id: cstr_to_owned(rdsys::rd_kafka_MemberDescription_consumer_id(member)),
+        host: cstr_to_owned(rdsys::rd_kafka_MemberDescription_host(member)),
+        assignment: copy_assignment(rdsys::rd_kafka_MemberDescription_assignment(member))
+            .unwrap_or_default(),
+        target_assignment: copy_assignment(rdsys::rd_kafka_MemberDescription_target_assignment(
+            member,
+        )),
+    }
+}
+
+unsafe fn build_consumer_group_description(
+    group: *const rdsys::rd_kafka_ConsumerGroupDescription_t,
+) -> ConsumerGroupDescriptionResult {
+    let group_id = cstr_to_owned(rdsys::rd_kafka_ConsumerGroupDescription_group_id(group));
+    let err = rdsys::rd_kafka_ConsumerGroupDescription_error(group);
+    if !err.is_null() {
+        let code = rdsys::rd_kafka_error_code(err);
+        if code.is_error() {
+            let message = cstr_to_opt_owned(rdsys::rd_kafka_error_string(err)).unwrap_or_default();
+            return Err((group_id, code.into(), message));
+        }
+    }
+    let member_count = rdsys::rd_kafka_ConsumerGroupDescription_member_count(group);
+    let members = (0..member_count)
+        .map(|i| {
+            build_member_description(rdsys::rd_kafka_ConsumerGroupDescription_member(group, i))
+        })
+        .collect();
+    Ok(ConsumerGroupDescription {
+        group_id,
+        is_simple_consumer_group: rdsys::rd_kafka_ConsumerGroupDescription_is_simple_consumer_group(
+            group,
+        ) != 0,
+        partition_assignor: cstr_to_opt_owned(
+            rdsys::rd_kafka_ConsumerGroupDescription_partition_assignor(group),
+        )
+        .unwrap_or_default(),
+        state: ConsumerGroupState::from_native(rdsys::rd_kafka_ConsumerGroupDescription_state(
+            group,
+        )),
+        group_type: ConsumerGroupType::from_native(rdsys::rd_kafka_ConsumerGroupDescription_type(
+            group,
+        )),
+        coordinator: Node::from_native(rdsys::rd_kafka_ConsumerGroupDescription_coordinator(group)),
+        members,
+    })
+}
+
+struct DescribeConsumerGroupsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for DescribeConsumerGroupsFuture {
+    type Output = KafkaResult<Vec<ConsumerGroupDescriptionResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_DescribeConsumerGroups_result(event.ptr()) };
+        if res.is_null() {
+            let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+            return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
+                "describe consumer groups request received response of incorrect type ({})",
+                typ
+            ))));
+        }
+        let mut n = 0;
+        let groups = unsafe { rdsys::rd_kafka_DescribeConsumerGroups_result_groups(res, &mut n) };
+        let out = (0..n)
+            .map(|i| unsafe { build_consumer_group_description(*groups.add(i)) })
+            .collect();
+        Poll::Ready(Ok(out))
     }
 }
 

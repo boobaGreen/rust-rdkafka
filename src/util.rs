@@ -258,6 +258,19 @@ pub unsafe fn cstr_to_owned(cstr: *const c_char) -> String {
         .into_owned()
 }
 
+/// Converts a C string that may be null into an [`Option<String>`].
+///
+/// # Safety
+///
+/// `cstr` must be null or point to a valid, null-terminated C string.
+pub(crate) unsafe fn cstr_to_opt_owned(cstr: *const c_char) -> Option<String> {
+    if cstr.is_null() {
+        None
+    } else {
+        Some(cstr_to_owned(cstr))
+    }
+}
+
 pub(crate) struct ErrBuf {
     buf: [u8; ErrBuf::MAX_ERR_LEN],
 }

@@ -5,8 +5,9 @@ use std::time::Duration;
 use backon::{BlockingRetryable, ExponentialBuilder};
 
 use rdkafka::admin::{
-    AdminClient, AdminOptions, AlterConfig, ConfigEntry, ConfigSource, GroupResult, NewPartitions,
-    NewTopic, OwnedResourceSpecifier, ResourceSpecifier, TopicReplication,
+    AdminClient, AdminOptions, AlterConfig, ConfigEntry, ConfigSource, ConsumerGroupState,
+    ConsumerGroupType, GroupResult, NewPartitions, NewTopic, OwnedResourceSpecifier,
+    ResourceSpecifier, TopicReplication,
 };
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, DefaultConsumerContext};
@@ -580,6 +581,95 @@ async fn test_groups() {
                 ))
             ])
         );
+    }
+}
+
+/// A consumer of `group_name` subscribed to `topic_name`, polled until it has
+/// an assignment.
+fn create_active_consumer(group_name: &str, topic_name: &str, protocol: &str) -> BaseConsumer {
+    let consumer: BaseConsumer = create_config()
+        .set("group.id", group_name)
+        .set("group.protocol", protocol)
+        .set("client.id", "describe-groups-test")
+        .create()
+        .expect("create consumer failed");
+    consumer.subscribe(&[topic_name]).expect("subscribe failed");
+    for _ in 0..300 {
+        let _ = consumer.poll(Duration::from_millis(100));
+        if consumer.assignment().map(|a| a.count()).unwrap_or(0) > 0 {
+            return consumer;
+        }
+    }
+    panic!("consumer of {} got no assignment", group_name);
+}
+
+#[tokio::test]
+async fn test_describe_consumer_groups() {
+    let admin_client = create_admin_client();
+    let opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(30)));
+
+    // A classic group with committed offsets and no members.
+    {
+        let group_name = rand_test_group();
+        create_consumer_group(&group_name).await;
+        let res = admin_client
+            .describe_consumer_groups(&[&group_name], &opts)
+            .await
+            .expect("describe consumer groups failed");
+        assert_eq!(res.len(), 1);
+        let group = res[0].as_ref().expect("group description failed");
+        assert_eq!(group.group_id, group_name);
+        assert_eq!(group.state, ConsumerGroupState::Empty);
+        assert_eq!(group.group_type, ConsumerGroupType::Classic);
+        assert!(group.members.is_empty());
+        assert!(group.coordinator.is_some());
+    }
+
+    // Active groups: one member each, with its assignment. The consumer
+    // protocol (KIP-848) needs Kafka 4.
+    let mut protocols = vec![("classic", ConsumerGroupType::Classic)];
+    if get_broker_version() >= KafkaVersion(4, 0, 0, 0) {
+        protocols.push(("consumer", ConsumerGroupType::Consumer));
+    }
+    for (protocol, group_type) in protocols {
+        let group_name = rand_test_group();
+        let topic_name = rand_test_topic("test_describe_consumer_groups");
+        create_topic(&topic_name, 3).await;
+        let consumer = create_active_consumer(&group_name, &topic_name, protocol);
+        let res = admin_client
+            .describe_consumer_groups(&[&group_name], &opts)
+            .await
+            .expect("describe consumer groups failed");
+        let group = res[0].as_ref().expect("group description failed");
+        assert_eq!(group.state, ConsumerGroupState::Stable, "{}", protocol);
+        assert_eq!(group.group_type, group_type);
+        assert_eq!(group.members.len(), 1);
+        let member = &group.members[0];
+        assert_eq!(member.client_id, "describe-groups-test");
+        assert!(!member.consumer_id.is_empty());
+        assert_eq!(member.assignment.elements_for_topic(&topic_name).len(), 3);
+        drop(consumer);
+    }
+
+    // A group that is not a consumer group is an error, not a crash; an
+    // unknown name is a dead group.
+    {
+        let unknown_group_name = rand_test_group();
+        let res = admin_client
+            .describe_consumer_groups(&[&unknown_group_name], &opts)
+            .await
+            .expect("describe consumer groups failed");
+        match &res[0] {
+            Ok(group) => {
+                assert_eq!(group.group_id, unknown_group_name);
+                assert_eq!(group.state, ConsumerGroupState::Dead);
+                assert!(group.members.is_empty());
+            }
+            Err((name, code, _)) => {
+                assert_eq!(name, &unknown_group_name);
+                assert_eq!(*code, RDKafkaErrorCode::GroupIdNotFound);
+            }
+        }
     }
 }
 
