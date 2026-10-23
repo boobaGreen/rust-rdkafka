@@ -7,6 +7,7 @@ use backon::{BlockingRetryable, ExponentialBuilder};
 use rdkafka::admin::{
     AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
     AdminClient, AdminOptions, AlterConfig, ConfigEntry, ConfigSource, ConsumerGroupState,
+    IncrementalAlterConfig,
     ConsumerGroupType, GroupResult, NewPartitions, NewTopic, OwnedResourceSpecifier,
     ResourceSpecifier, TopicReplication,
 };
@@ -533,6 +534,73 @@ async fn test_configs() {
         .await
         .expect("alter configs failed");
     assert_eq!(res, &[Ok(OwnedResourceSpecifier::Broker(0))]);
+}
+
+/// IncrementalAlterConfigs (KIP-339): changing one entry leaves the others
+/// as they are, including one changed concurrently by another client. With
+/// AlterConfigs the second change would be lost.
+#[tokio::test]
+async fn test_incremental_alter_configs_keeps_concurrent_changes() {
+    let admin_client = create_admin_client();
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(30)));
+    let name = rand_test_topic("incremental");
+    let topic = NewTopic::new(&name, 1, TopicReplication::Fixed(1));
+    admin_client
+        .create_topics(&[topic], &opts)
+        .await
+        .expect("topic creation failed");
+
+    let res = ResourceSpecifier::Topic(&name);
+    // Actor A sets retention.ms; actor B, concurrently, sets cleanup.policy.
+    let a = IncrementalAlterConfig::new(res).set("retention.ms", "123456");
+    let b = IncrementalAlterConfig::new(res).set("cleanup.policy", "compact");
+    let (ra, rb) = futures_util::future::join(
+        admin_client.incremental_alter_configs(&[a], &opts),
+        admin_client.incremental_alter_configs(&[b], &opts),
+    )
+    .await;
+    assert_eq!(
+        ra.expect("incremental alter A failed"),
+        &[Ok(OwnedResourceSpecifier::Topic(name.clone()))]
+    );
+    assert_eq!(
+        rb.expect("incremental alter B failed"),
+        &[Ok(OwnedResourceSpecifier::Topic(name.clone()))]
+    );
+
+    // Both survive.
+    let mut tries = 0;
+    loop {
+        let described = admin_client
+            .describe_configs(&[res], &opts)
+            .await
+            .expect("describe configs failed");
+        let config = described[0].as_ref().expect("describe configs failed");
+        let retention = config.get("retention.ms").and_then(|e| e.value.clone());
+        let policy = config.get("cleanup.policy").and_then(|e| e.value.clone());
+        if retention.as_deref() == Some("123456") && policy.as_deref() == Some("compact") {
+            break;
+        } else if tries >= 5 {
+            panic!("retention={:?} policy={:?}", retention, policy);
+        }
+        tries += 1;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // Delete reverts to the default; an unknown topic is a per-resource error.
+    let d = IncrementalAlterConfig::new(res).delete("retention.ms");
+    let rd = admin_client
+        .incremental_alter_configs(&[d], &opts)
+        .await
+        .expect("incremental delete failed");
+    assert_eq!(rd, &[Ok(OwnedResourceSpecifier::Topic(name.clone()))]);
+    let missing = IncrementalAlterConfig::new(ResourceSpecifier::Topic("no-such-topic-xyz"))
+        .set("retention.ms", "1");
+    let rm = admin_client
+        .incremental_alter_configs(&[missing], &opts)
+        .await
+        .expect("request itself should succeed");
+    assert!(matches!(rm[0], Err((_, RDKafkaErrorCode::UnknownTopicOrPartition))), "{:?}", rm);
 }
 
 #[tokio::test]

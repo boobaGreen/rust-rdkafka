@@ -110,6 +110,9 @@ pub use bindings::rd_kafka_conf_res_t as RDKafkaConfRes;
 /// Response error.
 pub use bindings::rd_kafka_resp_err_t as RDKafkaRespErr;
 
+/// Native rdkafka incremental alter config operation type.
+pub use bindings::rd_kafka_AlterConfigOpType_t as RDKafkaAlterConfigOpType;
+
 /// Admin operation.
 pub use bindings::rd_kafka_admin_op_t as RDKafkaAdminOp;
 

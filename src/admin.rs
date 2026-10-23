@@ -24,7 +24,7 @@ use rdkafka_sys::types::*;
 
 use crate::client::{Client, ClientContext, DefaultClientContext, NativeQueue};
 use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
-use crate::error::{IsError, KafkaError, KafkaResult};
+use crate::error::{IsError, KafkaError, KafkaResult, RDKafkaError};
 use crate::log::{trace, warn};
 use crate::util::{
     cstr_to_opt_owned, cstr_to_owned, AsCArray, ErrBuf, IntoOpaque, KafkaDrop, NativePtr, Timeout,
@@ -532,6 +532,54 @@ impl<C: ClientContext> AdminClient<C> {
         let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
         unsafe {
             rdsys::rd_kafka_AlterConfigs(
+                self.client.native_ptr(),
+                native_configs.as_c_array(),
+                native_configs.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            );
+        }
+        Ok(rx)
+    }
+
+    /// Alters configuration parameters for the specified resources
+    /// incrementally: only the listed entries change (set, delete, append,
+    /// subtract), the others keep their value. Requires brokers >= 2.3
+    /// (KIP-339). Unlike [`AdminClient::alter_configs`], a concurrent change
+    /// to another entry by another client is not overwritten.
+    ///
+    /// As for `alter_configs`, the operation is not transactional across
+    /// resources: check the result of each one.
+    pub fn incremental_alter_configs<'a, I>(
+        &self,
+        configs: I,
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<AlterConfigsResult>>>
+    where
+        I: IntoIterator<Item = &'a IncrementalAlterConfig<'a>>,
+    {
+        match self.incremental_alter_configs_inner(configs, opts) {
+            Ok(rx) => Either::Left(IncrementalAlterConfigsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn incremental_alter_configs_inner<'a, I>(
+        &self,
+        configs: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>>
+    where
+        I: IntoIterator<Item = &'a IncrementalAlterConfig<'a>>,
+    {
+        let mut native_configs = Vec::new();
+        let mut err_buf = ErrBuf::new();
+        for c in configs {
+            native_configs.push(c.to_native(&mut err_buf)?);
+        }
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        unsafe {
+            rdsys::rd_kafka_IncrementalAlterConfigs(
                 self.client.native_ptr(),
                 native_configs.as_c_array(),
                 native_configs.len(),
@@ -1867,6 +1915,164 @@ impl Future for DeleteRecordsFuture {
             TopicPartitionList::from_ptr(rdsys::rd_kafka_topic_partition_list_copy(tpl))
         };
         Poll::Ready(Ok(tpl))
+    }
+}
+
+//
+// Incremental alter configs handling
+//
+
+/// The operation applied to one configuration entry by
+/// [`AdminClient::incremental_alter_configs`] (KIP-339).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlterConfigOpType {
+    /// Set the entry to the given value.
+    Set,
+    /// Delete the entry, reverting it to its default.
+    Delete,
+    /// Append the value to a list-typed entry.
+    Append,
+    /// Remove the value from a list-typed entry.
+    Subtract,
+}
+
+impl AlterConfigOpType {
+    fn to_native(self) -> RDKafkaAlterConfigOpType {
+        match self {
+            AlterConfigOpType::Set => RDKafkaAlterConfigOpType::RD_KAFKA_ALTER_CONFIG_OP_TYPE_SET,
+            AlterConfigOpType::Delete => {
+                RDKafkaAlterConfigOpType::RD_KAFKA_ALTER_CONFIG_OP_TYPE_DELETE
+            }
+            AlterConfigOpType::Append => {
+                RDKafkaAlterConfigOpType::RD_KAFKA_ALTER_CONFIG_OP_TYPE_APPEND
+            }
+            AlterConfigOpType::Subtract => {
+                RDKafkaAlterConfigOpType::RD_KAFKA_ALTER_CONFIG_OP_TYPE_SUBTRACT
+            }
+        }
+    }
+}
+
+/// Configuration for an IncrementalAlterConfigs operation on one resource.
+pub struct IncrementalAlterConfig<'a> {
+    /// Identifies the resource to be altered.
+    pub specifier: ResourceSpecifier<'a>,
+    /// The operations, in order: entry name, operation, value (ignored for
+    /// `Delete`).
+    pub ops: Vec<(&'a str, AlterConfigOpType, &'a str)>,
+}
+
+impl<'a> IncrementalAlterConfig<'a> {
+    /// Creates a new `IncrementalAlterConfig` with no operations.
+    pub fn new(specifier: ResourceSpecifier<'_>) -> IncrementalAlterConfig<'_> {
+        IncrementalAlterConfig {
+            specifier,
+            ops: Vec::new(),
+        }
+    }
+
+    /// Sets the entry `key` to `value`.
+    pub fn set(mut self, key: &'a str, value: &'a str) -> IncrementalAlterConfig<'a> {
+        self.ops.push((key, AlterConfigOpType::Set, value));
+        self
+    }
+
+    /// Deletes the entry `key`, reverting it to its default.
+    pub fn delete(mut self, key: &'a str) -> IncrementalAlterConfig<'a> {
+        self.ops.push((key, AlterConfigOpType::Delete, ""));
+        self
+    }
+
+    /// Applies `op` to the entry `key` with `value`.
+    pub fn op(
+        mut self,
+        key: &'a str,
+        op: AlterConfigOpType,
+        value: &'a str,
+    ) -> IncrementalAlterConfig<'a> {
+        self.ops.push((key, op, value));
+        self
+    }
+
+    fn to_native(&self, _err_buf: &mut ErrBuf) -> KafkaResult<NativeConfigResource> {
+        let (name, typ) = match self.specifier {
+            ResourceSpecifier::Topic(name) => (
+                CString::new(name)?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_TOPIC,
+            ),
+            ResourceSpecifier::Group(name) => (
+                CString::new(name)?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_GROUP,
+            ),
+            ResourceSpecifier::Broker(id) => (
+                CString::new(format!("{}", id))?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_BROKER,
+            ),
+        };
+        let config = unsafe {
+            NativeConfigResource::from_ptr(rdsys::rd_kafka_ConfigResource_new(typ, name.as_ptr()))
+                .unwrap()
+        };
+        for (key, op, val) in &self.ops {
+            let key_c = CString::new(*key)?;
+            let val_c = CString::new(*val)?;
+            // For DELETE librdkafka requires a null value.
+            let val_ptr = if *op == AlterConfigOpType::Delete {
+                std::ptr::null()
+            } else {
+                val_c.as_ptr()
+            };
+            let err = unsafe {
+                RDKafkaError::from_ptr(rdsys::rd_kafka_ConfigResource_add_incremental_config(
+                    config.ptr(),
+                    key_c.as_ptr(),
+                    op.to_native(),
+                    val_ptr,
+                ))
+            };
+            if err.is_error() {
+                return Err(KafkaError::AdminOpCreation(err.string()));
+            }
+        }
+        Ok(config)
+    }
+}
+
+struct IncrementalAlterConfigsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for IncrementalAlterConfigsFuture {
+    type Output = KafkaResult<Vec<AlterConfigsResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_IncrementalAlterConfigs_result(event.ptr()) };
+        if res.is_null() {
+            let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+            return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
+                "incremental alter configs request received response of incorrect type ({})",
+                typ
+            ))));
+        }
+        let mut n = 0;
+        let resources =
+            unsafe { rdsys::rd_kafka_IncrementalAlterConfigs_result_resources(res, &mut n) };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let resource = unsafe { *resources.add(i) };
+            let specifier = extract_config_specifier(resource)?;
+            // Per-resource error (e.g. unknown topic, invalid value).
+            let err: RDKafkaErrorCode =
+                unsafe { rdsys::rd_kafka_ConfigResource_error(resource) }.into();
+            if err == RDKafkaErrorCode::NoError {
+                out.push(Ok(specifier));
+            } else {
+                out.push(Err((specifier, err)));
+            }
+        }
+        Poll::Ready(Ok(out))
     }
 }
 
